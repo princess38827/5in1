@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""
+Five-in-One Agent (local-first, no external paid APIs required)
+
+- Modes: chat, summarize, codegen, test, deploy
+- Designed to run with Python standard library only.
+- Behavior:
+  - Chat/summarize/codegen use lightweight local heuristics by default (free and fully controlled).
+  - If a local LLM integration becomes available (for example, a package providing `local_llm_generate`), the agent will prefer it automatically.
+  - Test runs commands and captures output.
+  - Deploy is a dry-run by default and can be extended to run real deploy commands.
+
+Usage examples:
+    python agents/five_in_one_agent.py --mode chat --input "What's the release plan?"
+    python agents/five_in_one_agent.py --mode summarize --input-file notes.md
+    python agents/five_in_one_agent.py --mode codegen --spec "function to reverse a string" --language python
+    python agents/five_in_one_agent.py --mode test --test-cmd "pytest -q"
+    python agents/five_in_one_agent.py --mode deploy --target staging --no-dry-run
+
+This file will be committed to the repository as a lightweight, self-contained agent you can run anywhere.
+"""
+
+from __future__ import annotations
+
+import argparse
+import html
+import json
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+
+def _local_llm_available() -> bool:
+    """Detect a pluggable local LLM entrypoint.
+
+    This intentionally does not depend on any third-party package. If you later install
+    a local LLM package that exposes a `local_llm_generate(prompt: str) -> str` function
+    (in the PYTHONPATH), this function will return True and the agent will use it.
+    """
+    try:
+        import importlib
+
+        spec = importlib.util.find_spec("local_llm_generate")
+        if spec is not None:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+@dataclass
+class FiveInOneAgent:
+    """A small, local-first five-in-one agent.
+
+    The implementation below deliberately uses only the Python standard library so it
+    requires no external paid services and is fully controlled by you. Replace or extend
+    the `call_llm` method to integrate a real model (local or remote) when desired.
+    """
+
+    # Placeholder for future client objects (kept Optional to avoid mandatory dependencies)
+    client: Optional[object] = None
+
+    # --- LLM abstraction -------------------------------------------------
+    def call_llm(self, prompt: str) -> str:
+        """Call an LLM-like interface.
+
+        Default: local heuristic. If a ``local_llm_generate`` function becomes available
+        in PYTHONPATH (for example when you wire a local model), it will be used.
+        """
+        # Try to use a pluggable local LLM function if present
+        try:
+            import importlib
+
+            mod = importlib.import_module("local_llm_generate")
+            if hasattr(mod, "generate"):
+                return mod.generate(prompt)
+        except Exception:
+            # Fall back to local heuristics
+            pass
+
+        # Very small heuristic responder (deterministic and free)
+        prompt = prompt.strip()
+        if not prompt:
+            return ""
+        # If prompt looks like an instruction to write code, return a small template
+        lower = prompt.lower()
+        if any(tok in lower for tok in ("implement", "write", "function", "class", "code")):
+            return (
+                "# Generated code (placeholder)\n" "# Prompt: "
+                + html.escape(prompt)[:1000]
+                + "\n\n# TODO: replace with a real codegen model or local model integration."
+            )
+
+        # If prompt looks like a request to summarize, return first sentences
+        if any(tok in lower for tok in ("summarize", "tl;dr", "short", "brief")):
+            lines = prompt.splitlines()
+            if not lines:
+                return ""
+            return " ".join(lines[:3])
+
+        # Otherwise echo-style assistant
+        return f"[assistant] {prompt}"
+
+    # --- Modes -----------------------------------------------------------
+    def chat(self, prompt: str) -> str:
+        """Chat/assistant mode: returns a short assistant-style reply."""
+        return self.call_llm(prompt)
+
+    def summarize(self, text: str, max_length: int = 400) -> str:
+        """Summarize text using a local-first approach.
+
+        This implementation picks the first few sentences/lines as a cheap summary.
+        It's intentionally simple and deterministic so it runs anywhere for free.
+        """
+        text = (text or "").strip()
+        if not text:
+            return ""
+
+        # Split on double newlines (paragraphs) or lines; prefer paragraphs
+        paras = [p.strip() for p in text.split("\n\n") if p.strip()]
+        if paras:
+            summary = paras[0]
+        else:
+            lines = [l.strip() for l in text.splitlines() if l.strip()]
+            summary = " ".join(lines[:3])
+
+        if len(summary) > max_length:
+            summary = summary[: max_length - 3].rsplit(" ", 1)[0] + "..."
+        return summary
+
+    def codegen(self, spec: str, language: str = "python") -> str:
+        """Generate starter code from a spec using the local LLM abstraction.
+
+        The default implementation returns a tiny scaffold you can expand or replace with
+        a stronger local model integration.
+        """
+        prompt = f"Generate {language} code for the following specification:\n{spec}\nProvide only the code."
+        out = self.call_llm(prompt)
+        # If call_llm returned an assistant-style reply, try to sanitize to code-like content
+        return out
+
+    def test(self, test_cmd: str = "pytest -q", timeout: Optional[int] = 300) -> str:
+        """Run tests (or arbitrary commands) and capture output.
+
+        This runs the command locally and returns the combined stdout/stderr and return code.
+        """
+        try:
+            completed = subprocess.run(
+                test_cmd,
+                shell=True,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=timeout,
+            )
+            return f"[test result] returncode={completed.returncode}\n{completed.stdout}"
+        except subprocess.TimeoutExpired:
+            return f"[test error] command timed out after {timeout} seconds"
+        except Exception as exc:  # pragma: no cover - environment-dependent
+            return f"[test error] {exc}"
+
+    def deploy(self, target: str = "staging", dry_run: bool = True, commands: Optional[list[str]] = None) -> str:
+        """Deploy mode: By default a dry-run that reports intended actions.
+
+        Extend `commands` with actual shell commands to run when `dry_run` is False.
+        """
+        if commands is None:
+            commands = []
+
+        if dry_run:
+            lines = [f"[deploy dry-run] would deploy to {target}"]
+            if commands:
+                lines.append("commands:")
+                lines.extend(f"  - {c}" for c in commands)
+            return "\n".join(lines)
+
+        # Execute provided commands sequentially and capture output
+        outputs = [f"[deploy] starting deployment to {target}"]
+        for cmd in commands:
+            try:
+                completed = subprocess.run(
+                    cmd,
+                    shell=True,
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+                outputs.append(f"$ {cmd}\nreturncode={completed.returncode}\n{completed.stdout}")
+            except Exception as exc:  # pragma: no cover - environment-dependent
+                outputs.append(f"$ {cmd}\nERROR: {exc}")
+        outputs.append(f"[deploy] finished deployment to {target}")
+        return "\n\n".join(outputs)
+
+    # --- Helpers ---------------------------------------------------------
+    @staticmethod
+    def read_input_file(path: str) -> str:
+        p = Path(path)
+        if not p.exists():
+            raise FileNotFoundError(f"Input file not found: {path}")
+        return p.read_text(encoding="utf-8")
+
+
+# --- CLI -----------------------------------------------------------------
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Five-in-One Agent (local-first)")
+    parser.add_argument("--mode", required=True, choices=["chat", "summarize", "codegen", "test", "deploy"])
+    parser.add_argument("--input", help="Direct input text (for chat/summarize/codegen)")
+    parser.add_argument("--input-file", help="Path to input file (for summarize)")
+    parser.add_argument("--spec", help="Spec for codegen")
+    parser.add_argument("--language", default="python", help="Language for code generation")
+    parser.add_argument("--test-cmd", default="pytest -q", help="Command to run tests")
+    parser.add_argument("--target", default="staging", help="Deployment target")
+    parser.add_argument("--no-dry-run", dest="no_dry_run", action="store_true", help="Run deploy commands for real")
+    parser.add_argument("--deploy-cmd", action="append", help="Shell command to run during deploy (can be repeated)")
+    parser.add_argument("--json-output", action="store_true", help="Print JSON with mode/result")
+    args = parser.parse_args(argv)
+
+    agent = FiveInOneAgent()
+
+    try:
+        if args.mode == "chat":
+            if not args.input:
+                parser.error("--input is required in chat mode")
+            result = agent.chat(args.input)
+        elif args.mode == "summarize":
+            if args.input_file:
+                text = agent.read_input_file(args.input_file)
+            elif args.input:
+                text = args.input
+            else:
+                parser.error("Either --input or --input-file is required in summarize mode")
+            result = agent.summarize(text)
+        elif args.mode == "codegen":
+            spec = args.spec or args.input or parser.error("Provide --spec or --input for codegen")
+            result = agent.codegen(spec, language=args.language)
+        elif args.mode == "test":
+            result = agent.test(test_cmd=args.test_cmd)
+        elif args.mode == "deploy":
+            dry_run = not args.no_dry_run
+            commands = args.deploy_cmd or []
+            result = agent.deploy(target=args.target, dry_run=dry_run, commands=commands)
+        else:
+            parser.error("Unknown mode")
+    except Exception as exc:  # pragma: no cover - top-level error handling
+        result = f"[error] {exc}"
+
+    if args.json_output:
+        print(json.dumps({"mode": args.mode, "result": result}))
+    else:
+        print(result)
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
